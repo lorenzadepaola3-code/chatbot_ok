@@ -1,0 +1,36 @@
+cd C:\Users\loren\Downloads\chatbot_ok
+
+# Ensure .env will never be committed again
+# Open .gitignore and make sure it contains at least:
+# ---------------------------------------------
+# Secrets
+.env
+#
+# Python caches
+__pycache__/
+core/__pycache__/
+tools/__pycache__/
+#
+# Office temp files
+~$*.xlsx
+# ---------------------------------------------
+
+# Create a brand new branch with NO history
+git checkout --orphan clean-main
+
+# Reset the index so we decide from scratch what goes in
+git rm -r --cached .
+
+# Track big files with LFS (add CSVs too to avoid warnings)
+git lfs install
+git lfs track "*.faiss" "*.npy" "*.npz" "*.plk" "*.pkl" "*.safetensors" "*.bin" "*.pt" "*.h5" "data/*.csv" "processed_ecb_data/**"
+git add .gitattributes
+
+# Stage everything EXCEPT .env (git will skip it thanks to .gitignore)
+git add -A
+
+# Sanity check: .env must NOT be in "git status"
+git status
+
+# Create the clean first commit (no secrets)
+git commit -m "Initial clean commit: ECB chatbot + processed artifacts via Git LFS (no secrets)"

@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Chatbot",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/core/test.py",
+            "console": "integratedTerminal",
+            "justMyCode": false
+
+
+        }
+    ]
+}

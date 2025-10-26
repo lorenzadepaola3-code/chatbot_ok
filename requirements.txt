@@ -1,0 +1,33 @@
+# Core libraries
+numpy
+pandas
+tqdm
+scikit-learn
+
+# FAISS for vector search
+faiss-cpu
+
+# Elasticsearch client
+elasticsearch
+
+# OpenAI API
+openai
+
+# Sentence Transformers for embeddings
+sentence-transformers
+
+# Streamlit for the frontend app
+streamlit
+
+# dotenv for environment variables
+python-dotenv
+
+# Optional: for better logging & debugging
+rich
+
+langchain 
+tiktoken
+rapidfuzz
+transformers
+torch
+huggingface-hub
