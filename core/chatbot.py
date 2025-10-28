@@ -19,6 +19,7 @@ from pathlib import Path
 from tools.sentiment import sentiment_components, USE_SENTIMENT, sentiment_facets_summary
 from core.prompts import SUMMARY_PROMPT
 
+
 LLM_CACHE_PATH = Path("processed_ecb_data/llm_summary_cache.json")
 LLM_DAILY_LIMIT = int(os.getenv("LLM_DAILY_LIMIT", "150"))  # max LLM calls/day
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "40"))
@@ -548,7 +549,7 @@ def _llm_compare_merge(
         f"{style}\nQuestion: {question}\nSources: {', '.join(sources)}\n"
         f"{('Tone facets: ' + tone_line) if tone_line else ''}\n\n"
         f"{joined}\n\n"
-        "Task: Produce ONE paragraph (140–180 words) comparing and contrasting the speakers' positions "
+        "Task: Produce ONE paragraph (200-250 words) comparing and contrasting the speakers' positions "
         "STRICTLY using only the provided sentences. Highlight clear differences and any explicit common ground. "
         "Do NOT guess intentions or add external context; if a difference is not evidenced, omit it. "
         "If evidence for one speaker is sparse, acknowledge the limitation. Mention each speaker once. "
