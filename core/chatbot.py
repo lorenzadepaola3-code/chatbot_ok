@@ -358,6 +358,107 @@ SPEAKER_LIST = sorted(
 SPEAKER_LIST = [s for s in SPEAKER_LIST if s]
 SPEAKER_LOWER = [s.lower() for s in SPEAKER_LIST]
 
+def _tone_dropdown_html(raw_texts: List[str]) -> str:
+    """
+    Build a collapsible HTML/markdown block with tone descriptor + facet values.
+    Shown *outside* of the answer paragraph (so no numbers pollute the main text).
+    """
+    try:
+        tone_text, facets = sentiment_components(raw_texts)
+    except Exception:
+        return ""  # safe fallback
+
+    # Pretty-print facet values (2 decimals), hide raw_counts
+    rows = []
+    for k in ["hawkish","dovish","optimistic","cautious","supportive","critical"]:
+        v = facets.get(k, 0.0)
+        rows.append(f"<tr><td style='padding:2px 8px'>{k.title()}</td><td>{v:.2f}</td></tr>")
+    table = "<table>" + "".join(rows) + "</table>"
+
+    # <details> works in Streamlit's unsafe_allow_html context (we already use HTML containers)
+    return (
+        "<details style='margin-top:8px'><summary><b>🔎 Tone analysis</b></summary>"
+        f"<p style='margin:8px 0 4px'><i>{tone_text}</i></p>{table}"
+        "</details>"
+    )
+
+def _extract_year_range(q: str) -> List[str]:
+    """
+    Extracts two endpoint years from patterns like 'from 2019 to 2021' or '2019–2021'.
+    Returns [start, end] if found, else [].
+    """
+    m = re.search(r"\b(20\d{2})\s*(?:\-|–|to|and)\s*(20\d{2})\b", q)
+    if m:
+        y1, y2 = m.group(1), m.group(2)
+        if y1 != y2:
+            return [y1, y2]
+    m2 = re.search(r"\bfrom\s+(20\d{2})\s+to\s+(20\d{2})\b", q.lower())
+    if m2:
+        y1, y2 = m2.group(1), m2.group(2)
+        if y1 != y2:
+            return [y1, y2]
+    return []
+
+def detect_compare_topics(q: str) -> List[str]:
+    """
+    Heuristic: if the query contains 2+ distinct high-signal keywords (from _extract_keywords),
+    treat it as a topic comparison request (e.g., 'inflation vs growth' or 'digital euro and inflation').
+    """
+    kws = _extract_keywords(q)
+    # keep distinct, non-overlapping tokens
+    unique = []
+    for k in kws:
+        if all(k.lower() not in u.lower() and u.lower() not in k.lower() for u in unique):
+            unique.append(k)
+    return unique[:3]  # cap
+
+def detect_speakers(text: str) -> List[str]:
+    """
+    Heuristically detect ECB speakers mentioned in a query string.
+
+    Looks for known ECB board members / governors mentioned by first or last name
+    and returns a list of distinct matches in canonical 'First Last' form.
+    This helps the comparison logic decide if the user is asking to compare speakers.
+    """
+
+    # ✅ 1. Basic normalization
+    t = text.lower()
+
+    # ✅ 2. Common ECB speaker list (extend as needed)
+    known_speakers = {
+        "christine lagarde": ["lagarde", "christine lagarde"],
+        "isabel schnabel": ["schnabel", "isabel schnabel"],
+        "piero cipollone": ["cipollone", "piero cipollone"],
+        "fabio panetta": ["panetta", "fabio panetta"],
+        "luis de guindos": ["guindos", "luis de guindos"],
+        "mario draghi": ["draghi", "mario draghi"],
+        "willem duisenberg": ["duisenberg", "willem duisenberg"],
+        "jean-claude trichet": ["trichet", "jean-claude trichet"],
+        "mario centeno": ["centeno", "mario centeno"],
+        "philip lane": ["lane", "philip lane"],
+        "olivier garnier": ["garnier", "olivier garnier"],
+        "yves mersch": ["mersch", "yves mersch"],
+        "bostjan jazbec": ["jazbec", "bostjan jazbec"],
+        "mario monti": ["monti", "mario monti"],  # optional external references
+    }
+
+    found = []
+    for full_name, patterns in known_speakers.items():
+        for p in patterns:
+            if re.search(rf"\b{re.escape(p)}\b", t):
+                found.append(full_name)
+                break  # avoid duplicates if both first and last matched
+
+    # ✅ 3. Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for s in found:
+        if s not in seen:
+            unique.append(s)
+            seen.add(s)
+
+    return unique
+
 
 def detect_speaker_from_query(q: str, score_cutoff: int = 75) -> Optional[str]:
     """
@@ -518,64 +619,97 @@ def _retrieve_for_speaker(question: str, speaker: str, year_hint: Optional[str])
     return docs[0] if docs else None
 
 
-def _llm_compare_merge(
+def _llm_single_merge(
     question: str,
     audience_level: str,
-    per_summaries: List[Tuple[str, str, Dict]],
-    tone_line: str = "",
+    partials: List[str],
+    segments: List[Dict],
+    tone_line: str = ""
 ) -> str:
     """
-    LLM contrast between multiple speakers.
-    per_summaries: list of (speaker_name, summary_text, meta)
+    One LLM call merging all partials into a single coherent paragraph.
+    IMPORTANT: does NOT inject tone/facet text into the prose. The caller is
+    responsible for appending any tone dropdown separately.
     """
-    if not per_summaries or len(per_summaries) < 2:
-        return "Insufficient distinct speaker material to compare."
+    if not partials:
+        return ""
 
+    # ---- cache key (stable across same speeches) ----
+    speech_ids = [s.get("speech_id", f"{s.get('date','')}_{s.get('title','')}") for s in segments]
+    ck = _final_cache_key(question, audience_level, speech_ids)
+    if ck in _FINAL_CACHE:
+        return _FINAL_CACHE[ck]
+
+    # ---- style / inputs ----
     style = _audience_instructions(audience_level)
-    blocks = []
-    sources = []
+    sources_line = "; ".join(f"{s.get('speaker','')} {s.get('date','')}" for s in segments)
 
-    for spk, summ, meta in per_summaries:
-        title = meta.get("title", "")
-        date = meta.get("date", "")
-        sources.append(f"{spk} {date}")
-        blocks.append(
-            f"Speaker: {spk}\nDate: {date}\nTitle: {title}\nExtractive sentences:\n{summ}"
-        )
+    joined_partials = "\n---\n".join(partials)
+    if len(joined_partials) > 8000:
+        joined_partials = joined_partials[:8000]
 
-    joined = "\n\n----\n\n".join(blocks)
+    # word target guidance
+    try:
+        target_words = int(FINAL_TARGET_WORDS)
+    except Exception:
+        target_words = 300
 
+    # Optional short background blurbs (safe, generic definitions)
+    background_phrases = _educational_blurb(_extract_keywords(question), max_items=2)
+    bg_instruction = (
+        f"\n\nBackground phrases (optional, only if strictly useful): {background_phrases}\n"
+        "If you use them, append 1–2 short sentences at the very end labeled 'Background:'. "
+        "Do NOT invent facts beyond these phrases."
+    ) if background_phrases else ""
+
+    # ---- prompt (NO tone/sentiment mention) ----
     prompt = (
-        f"{style}\nQuestion: {question}\nSources: {', '.join(sources)}\n"
-        f"{('Tone facets: ' + tone_line) if tone_line else ''}\n\n"
-        f"{joined}\n\n"
-        "Task: Produce ONE paragraph (200-250 words) comparing and contrasting the speakers' positions "
-        "STRICTLY using only the provided sentences. Highlight clear differences and any explicit common ground. "
-        "Do NOT guess intentions or add external context; if a difference is not evidenced, omit it. "
-        "If evidence for one speaker is sparse, acknowledge the limitation. Mention each speaker once. "
-        "Return only the paragraph."
+        f"{style}\n"
+        f"Question: {question}\n"
+        f"Sources (speaker date): {sources_line}\n\n"
+        "Extracted passages (already filtered; do not quote bibliographies):\n"
+        f"{joined_partials}\n"
+        f"{bg_instruction}\n\n"
+        f"Task: Produce ONE coherent factual answer of about {target_words} words. "
+        "Use ONLY the extracted passages and the provided background phrases (if any). "
+        "Do NOT invent numbers, quotes, or names not present in the passages. "
+        "Mention each speaker/date at most once. Merge overlapping points, remove duplication and greetings. "
+        "Avoid evaluative language about 'tone' or 'sentiment'; do not write anything like 'balanced', 'hawkish', "
+        "'dovish', 'optimistic', 'cautious', or facet scores. "
+        "If the material only partially answers the question, state that limitation briefly near the start. "
+        "Return only the answer paragraph and, if used, a single short 'Background:' line at the end."
     )
 
+    # ---- LLM call ----
+    max_tok = int(os.getenv("LLM_MAX_TOKENS", "1200"))
     try:
         resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            temperature=0.25,
-            max_tokens=480,
+            model=os.getenv("LLM_MODEL", LLM_MODEL),
+            temperature=float(os.getenv("LLM_TEMPERATURE", "0.25")),
+            max_tokens=max_tok,
             messages=[
-                {"role": "system", "content": "You compare speakers without hallucinations."},
+                {"role": "system", "content": "You are a concise, faithful ECB speech summarizer. Do not hallucinate."},
                 {"role": "user", "content": prompt},
             ],
-            timeout=50,
+            timeout=max(LLM_TIMEOUT, 90),
         )
-        out = resp.choices[0].message.content.strip()
+        out = (resp.choices[0].message.content or "").strip()
+        # compact whitespace
         out = re.sub(r"\s+", " ", out)
-        return out
-
+        if out:
+            _FINAL_CACHE[ck] = out
+            _save_final_cache()
+            try:
+                _inc_llm_used()
+            except Exception:
+                pass
+            return out
     except Exception as e:
-        logger.warning("compare merge failed: %s", e)
-        # Fallback: stitch summaries with simple labels
-        stitched = " ".join(f"{spk}: {summ}" for spk, summ, _ in per_summaries)
-        return stitched[:1500]
+        logger.warning("FINAL LLM single-merge failed: %s", e)
+
+    # ---- fallback local merge ----
+    return _merge_partials(question, partials, max_sentences=12)
+
 
 # FAISS search + hybrid re-ranking
 def faiss_search(
@@ -838,152 +972,257 @@ def generate_ecb_speech_response(
     year_filter: str = "Any",
     topic_filter: str = "Any",
 ) -> Tuple[str, List[Dict], int, str, str, int]:
+    """
+    Main orchestration for answering a user query over ECB speeches.
+
+    Returns:
+        final_answer (str): the answer text (with Sources + tone dropdown appended)
+        segments (List[Dict]): metadata for the evidence speeches used
+        steps (int): rough step counter for telemetry
+        status (str): status label
+        audience_level (str): echoed
+        depth (int): rough depth score
+    """
     question = user_input.strip()
     if not question:
         return "Please ask a question.", [], 1, "empty", audience_level, 1
 
-    # Extract date/year tokens
-    date_tokens = extract_date_tokens(question)
-    date_exact = date_tokens.get("date_exact")
-    year_in_query = date_tokens.get("year")  # was 'year' before; unify name
+    # ---- parse cues from query ------------------------------------------------
+    date_tokens = extract_date_tokens(question)             # your existing helper
+    years_in_text = _extract_years(question)                # existing year extractor
+    year_range = _extract_year_range(question)              # NEW: handles "2019-2021", "from 2020 to 2023"
+    if year_range and len(year_range) == 2:
+        # extend years list with endpoints; keep unique order
+        years_in_text = list(dict.fromkeys(years_in_text + year_range))
 
-    # Speaker (explicit filter overrides detection)
-    sp = None if speaker_filter in (None, "", "Any") else speaker_filter
-    if not sp:
-        sp = detect_speaker_from_query(question)
+    # speakers detected in the query (may be 0, 1, 2+)
+    compare_speakers = detect_speakers(question) or []
 
-    # Keywords + optional topic
+    # topics from query; also a focused detector for topic-comparisons
     kws = _extract_keywords(question)
-    if topic_filter not in ("Any", "", None):
-        tf = topic_filter.lower()
-        if tf not in (k.lower() for k in kws):
-            kws.append(tf)
+    topic_compare = detect_compare_topics(question)  # NEW: up to 3 distinct high-signal keywords
+    topic_kws = [k for k in kws if k.lower() not in {s.lower() for s in compare_speakers}]
 
-    ql = question.lower()
+    # optional UI filters
+    if speaker_filter and speaker_filter != "Any":
+        # if a filter is set, enforce / prepend it
+        if speaker_filter not in compare_speakers:
+            compare_speakers = [speaker_filter] + compare_speakers
+    if year_filter and year_filter != "Any":
+        if year_filter not in years_in_text:
+            years_in_text = [year_filter] + years_in_text
+    if topic_filter and topic_filter != "Any":
+        if topic_filter not in topic_compare:
+            topic_compare = [topic_filter] + topic_compare
+        if topic_filter not in topic_kws:
+            topic_kws = [topic_filter] + topic_kws
 
-    # Comparison detection
-    compare_speakers = detect_compare_speakers(question)
-    years_in_text = _extract_years(question)
-    compare_cues = re.search(r"\b(compare|contrast|difference|different|vs|versus|between)\b", ql)
-    and_join = len(compare_speakers) >= 2 and " and " in ql
-    single_multi_year = len(compare_speakers) == 1 and len(years_in_text) >= 2
-    wants_compare = bool(compare_cues or and_join or single_multi_year)
+    # lightweight "compare" cue detection
+    compare_cues = re.search(r"\b(compare|vs\.?|versus|contrast|difference|evolv(e|ed|ing)|change(d)?)\b", question, re.I)
+    single_multi_year = len(set(years_in_text)) >= 2
+    wants_compare = bool(compare_cues or len(compare_speakers) >= 2 or single_multi_year or len(topic_compare) >= 2)
 
+    # --------------------------------------------------------------------------
+    # COMPARISON BRANCH
+    # --------------------------------------------------------------------------
     if wants_compare:
-        topic_kws = [k for k in kws if k.lower() not in {s.lower() for s in compare_speakers}]
-        if not topic_kws and "inflation" in ql:
-            topic_kws = ["inflation"]
+        steps = 0
+        per_summaries: List[Tuple[str, str, Dict]] = []  # [(label, text, meta), ...]
+        segments: List[Dict] = []
 
-        per_summaries: List[Tuple[str, str, Dict]] = []
+        # cap axes to keep prompts manageable
+        speakers_axis = compare_speakers[:3] if len(compare_speakers) >= 2 else compare_speakers
+        years_axis = years_in_text[:3] if len(years_in_text) >= 2 else []
+        topics_axis = [t for t in topic_compare if t not in {s.lower() for s in compare_speakers}]
+        topics_axis = topics_axis[:2]
 
-        # Multi-speaker
-        if len(compare_speakers) >= 2:
-            # If exactly one year mentioned, use it as constraint
-            constraint_year = years_in_text[0] if len(years_in_text) == 1 else year_in_query
-            for spk_name in compare_speakers[:3]:
-                doc = _retrieve_topic_for_speaker(question, spk_name, constraint_year, topic_kws, top_k_chunks=64)
-                if not doc:
-                    continue
-                full_text = _strip_bibliography(_clean_for_summary(doc["text"]))
-                if len(full_text) > 12000:
-                    full_text = full_text[:12000]
-                per_summaries.append((spk_name, full_text, doc["meta"]))
+        no_speaker_compare = len(speakers_axis) == 0 and (len(years_axis) >= 2 or len(topics_axis) >= 2)
 
-        # Single speaker across multiple years
-        elif single_multi_year:
+        def _label(meta, sp_override=None, y_override=None, topic=None):
+            sp = sp_override or meta.get("speaker", "Unknown")
+            dt = y_override or (meta.get("date", "")[:4] or meta.get("date", ""))
+            lab = sp
+            if y_override:
+                lab += f" {y_override}"
+            elif meta.get("date"):
+                lab += f" {meta.get('date')}"
+            if topic:
+                lab += f" — {topic}"
+            return lab
+
+        def _fetch_for(speaker, year, topic_hint):
+            tk = ([topic_hint] + topic_kws) if topic_hint else topic_kws
+            return _retrieve_topic_for_speaker(question, speaker, year, tk, top_k_chunks=64)
+
+        # --- A) multiple speakers (optionally crossed with years or topics)
+        if len(speakers_axis) >= 2:
+            for spk in speakers_axis:
+                if years_axis:
+                    for y in years_axis:
+                        doc = _fetch_for(spk, y, topics_axis[0] if topics_axis else None)
+                        if not doc:
+                            continue
+                        txt = _strip_bibliography(_clean_for_summary(doc["text"]))
+                        if len(txt) > 12000:
+                            txt = txt[:12000]
+                        meta = doc["meta"].copy()
+                        meta["date"] = meta.get("date", f"{y}-??-??")
+                        per_summaries.append((_label(meta, sp_override=spk, y_override=y, topic=(topics_axis[0] if topics_axis else None)), txt, meta))
+                        segments.append(meta)
+                        steps += 1
+                elif topics_axis:
+                    for t in topics_axis:
+                        doc = _fetch_for(spk, year_filter if year_filter != "Any" else None, t)
+                        if not doc:
+                            continue
+                        txt = _strip_bibliography(_clean_for_summary(doc["text"]))
+                        if len(txt) > 12000:
+                            txt = txt[:12000]
+                        meta = doc["meta"]
+                        per_summaries.append((_label(meta, sp_override=spk, topic=t), txt, meta))
+                        segments.append(meta)
+                        steps += 1
+                else:
+                    doc = _fetch_for(spk, year_filter if year_filter != "Any" else None, None)
+                    if doc:
+                        txt = _strip_bibliography(_clean_for_summary(doc["text"]))
+                        if len(txt) > 12000:
+                            txt = txt[:12000]
+                        meta = doc["meta"]
+                        per_summaries.append((_label(meta, sp_override=spk), txt, meta))
+                        segments.append(meta)
+                        steps += 1
+
+        # --- B) one speaker across multiple years
+        elif single_multi_year and len(compare_speakers) == 1:
             spk_name = compare_speakers[0]
-            for y in years_in_text[:3]:
-                doc = _retrieve_topic_for_speaker(question, spk_name, y, topic_kws, top_k_chunks=64)
+            for y in years_axis:
+                doc = _fetch_for(spk_name, y, topics_axis[0] if topics_axis else None)
                 if not doc:
                     continue
-                full_text = _strip_bibliography(_clean_for_summary(doc["text"]))
-                if len(full_text) > 12000:
-                    full_text = full_text[:12000]
+                txt = _strip_bibliography(_clean_for_summary(doc["text"]))
+                if len(txt) > 12000:
+                    txt = txt[:12000]
                 meta = doc["meta"].copy()
                 meta["date"] = meta.get("date", f"{y}-??-??")
-                per_summaries.append((f"{spk_name} {y}", full_text, meta))
+                per_summaries.append((_label(meta, sp_override=spk_name, y_override=y, topic=(topics_axis[0] if topics_axis else None)), txt, meta))
+                segments.append(meta)
+                steps += 1
 
-        if len(per_summaries) < 2:
-            return (
-                "Not enough direct speech evidence to build the requested comparison.",
-                [],
-                2,
-                "insufficient_compare",
-                audience_level,
-                4,
+        # --- C) no explicit speaker: compare by year or by topic
+        elif no_speaker_compare:
+            if len(years_axis) >= 2:
+                for y in years_axis:
+                    docs = retrieve_grouped(
+                        question, top_k_chunks=64, neighbors=0, top_k_speeches=1,
+                        speaker=None, year=y, date_exact=None,
+                        must_keywords=topic_kws or _extract_keywords(question),
+                        full_speech_top=1
+                    )
+                    if not docs:
+                        continue
+                    doc = docs[0]
+                    txt = _strip_bibliography(_clean_for_summary(doc["text"]))
+                    if len(txt) > 12000:
+                        txt = txt[:12000]
+                    meta = doc["meta"].copy()
+                    meta["date"] = meta.get("date", f"{y}-??-??")
+                    per_summaries.append((_label(meta, topic=(topics_axis[0] if topics_axis else None)), txt, meta))
+                    segments.append(meta)
+                    steps += 1
+            elif len(topics_axis) >= 2:
+                for t in topics_axis:
+                    docs = retrieve_grouped(
+                        question, top_k_chunks=64, neighbors=0, top_k_speeches=1,
+                        speaker=None, year=year_filter if year_filter != "Any" else None, date_exact=None,
+                        must_keywords=[t], full_speech_top=1
+                    )
+                    if not docs:
+                        continue
+                    doc = docs[0]
+                    txt = _strip_bibliography(_clean_for_summary(doc["text"]))
+                    if len(txt) > 12000:
+                        txt = txt[:12000]
+                    meta = doc["meta"]
+                    per_summaries.append((_label(meta, topic=t), txt, meta))
+                    segments.append(meta)
+                    steps += 1
+
+        # Fallback if nothing gathered
+        if not per_summaries:
+            # try normal deep mode to at least produce a single answer
+            answer, segments, _, _, _, _ = generate_ecb_speech_response(
+                question, conversation_history, audience_level, documentation_needed, "deep",
+                speaker_filter, year_filter, topic_filter
             )
+            return answer, segments, steps + 1, "fallback_deep", audience_level, 4
 
-        tone_line = sentiment_facets_summary([txt for _, txt, _ in per_summaries]) if USE_SENTIMENT else ""
+        # Ask LLM to compare (make it a bit longer 180–240 words)
+        answer = _llm_compare_merge(
+            question,
+            audience_level,
+            per_summaries,
+            length_hint="180-240"  # << ensure your _llm_compare_merge reads this (or adjust inside it)
+        )
 
-        if USE_LLM:
-            answer = _llm_compare_merge(question, audience_level, per_summaries, tone_line)
-        else:
-            stitched = " ".join(f"{lbl}: {txt[:900]}" for lbl, txt, _ in per_summaries)
-            answer = stitched[:2500] + (f"\n\nTone: {tone_line}" if tone_line else "")
-
+        # Append sources and tone dropdown
+        tone_html = _tone_dropdown_html([txt for _, txt, _ in per_summaries]) if USE_SENTIMENT else ""
         srcs = "; ".join(f"{m.get('speaker')} ({m.get('date')})" for _, _, m in per_summaries)
-        answer += f"\n\nSources: {srcs}"
-        segments = [
-            {"speaker": m.get("speaker"), "date": m.get("date"), "title": m.get("title")}
-            for _, _, m in per_summaries
-        ]
-        return answer, segments, 5, "ok_compare", audience_level, 4
+        final = f"{answer}\n\nSources: {srcs}{('\n\n' + tone_html) if tone_html else ''}"
 
-    # Deep single-speaker mode (always full speeches, LLM only)
-    top_k_speeches = int(os.getenv("DEEP_TOP_SPEECHES", "2"))
-    full_speech_top = top_k_speeches
-    neighbors = 0
+        return final, segments, steps + 3, "ok_compare", audience_level, 5
 
-    docs = retrieve_grouped(
+    # --------------------------------------------------------------------------
+    # SINGLE (DEEP) ANSWER BRANCH
+    # --------------------------------------------------------------------------
+    # retrieve a handful of best speeches, then merge
+    ctx = retrieve_grouped(
         question,
         top_k_chunks=64,
-        neighbors=neighbors,
-        top_k_speeches=top_k_speeches,
-        speaker=sp,
-        year=year_filter if year_filter not in ("Any", "", None) else year_in_query,
-        date_exact=date_exact,
-        must_keywords=kws,
-        full_speech_top=full_speech_top,
+        neighbors=0,
+        top_k_speeches=5,
+        speaker=None if speaker_filter == "Any" else speaker_filter,
+        year=None if year_filter == "Any" else year_filter,
+        date_exact=None,
+        must_keywords=_extract_keywords(question),
+        full_speech_top=3,
     )
 
-    if not docs:
-        return (
-            "⚠️ No full speeches matched your query. Try simplifying or removing filters.",
-            [],
-            2,
-            "no_hits",
-            audience_level,
-            4,
-        )
+    if not ctx:
+        return "Sorry, I couldn’t find relevant ECB speeches for that query.", [], 2, "no_results", audience_level, 2
 
-    segments = []
-    partials = []
-    for d in docs:
-        meta = d["meta"]
-        segments.append(
-            {
-                "speech_id": d["speech_id"],
-                "speaker": meta.get("speaker"),
-                "date": meta.get("date"),
-                "title": meta.get("title"),
-            }
-        )
-        txt = _strip_bibliography(_clean_for_summary(d["text"]))
+    # Clean and prep partials
+    partials: List[str] = []
+    segments: List[Dict] = []
+    for doc in ctx[:5]:
+        txt = _strip_bibliography(_clean_for_summary(doc["text"]))
+        meta = doc["meta"]
+        segments.append(meta)
         if len(txt) > 14000:
             txt = txt[:14000]
         partials.append(txt)
 
-    tone_line = sentiment_facets_summary(partials) if USE_SENTIMENT else ""
+    tone_html = _tone_dropdown_html(partials) if USE_SENTIMENT else ""
 
     if USE_LLM:
-        final_answer = _llm_single_merge(question, audience_level, partials, segments, tone_line)
+        final_answer = _llm_single_merge(
+            question,
+            audience_level,
+            partials,
+            segments,
+            tone_line=""  # keep prose clean; tone is only in dropdown
+        )
     else:
+        # very rare fallback
         fallback = partials[0][:900]
-        final_answer = fallback + (f"\n\nTone: {tone_line}" if tone_line else "")
+        final_answer = fallback
 
+    # Append sources and tone
     srcs = "; ".join(f"{s['speaker']} ({s['date']})" for s in segments)
-    final_answer += f"\n\nSources: {srcs}"
+    final_answer = f"{final_answer}\n\nSources: {srcs}{('\n\n' + tone_html) if tone_html else ''}"
+
     return final_answer, segments, 5, "ok_deep", audience_level, 4
+
 
 def simple_answer_for_query(
     query: str,
