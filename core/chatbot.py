@@ -165,54 +165,68 @@ def _prepare_local_partials(docs: List[Dict], question: str, max_speeches: int) 
         partials.append(extr)
     return partials, segments
 
-def _llm_single_merge(question: str, audience_level: str,
-                      partials: List[str], segments: List[Dict], tone_line: str = "") -> str:
-    """One LLM call merging all partials; cached."""
+def _llm_single_merge(
+    question: str,
+    audience_level: str,
+    partials: List[str],
+    segments: List[Dict],
+    tone_line: str = ""
+) -> str:
+    """
+    One LLM call merging all partials into a single coherent paragraph.
+    IMPORTANT: does NOT inject tone/facet text into the prose. The caller is
+    responsible for appending any tone dropdown separately.
+    """
     if not partials:
         return ""
-    speech_ids = [s["speech_id"] for s in segments]
+
+    # ---- cache key (stable across same speeches) ----
+    speech_ids = [s.get("speech_id", f"{s.get('date','')}_{s.get('title','')}") for s in segments]
     ck = _final_cache_key(question, audience_level, speech_ids)
     if ck in _FINAL_CACHE:
         return _FINAL_CACHE[ck]
 
+    # ---- style / inputs ----
     style = _audience_instructions(audience_level)
-    sources_line = "; ".join(f"{s['speaker']} {s['date']}" for s in segments)
+    sources_line = "; ".join(f"{s.get('speaker','')} {s.get('date','')}" for s in segments)
+
     joined_partials = "\n---\n".join(partials)
     if len(joined_partials) > 8000:
         joined_partials = joined_partials[:8000]
 
-    # ensure numeric target words
+    # word target guidance
     try:
         target_words = int(FINAL_TARGET_WORDS)
     except Exception:
         target_words = 300
 
-    # include short background phrases (conservative educational blurbs)
+    # Optional short background blurbs (safe, generic definitions)
     background_phrases = _educational_blurb(_extract_keywords(question), max_items=2)
     bg_instruction = (
-        f"\n\nBackground phrases (optional short context to append if useful): {background_phrases}\n"
-        "If helpful to understand terms or context, append 1-2 short sentences labeled 'Background:' at the end; "
-        "do NOT invent new facts beyond these phrases."
+        f"\n\nBackground phrases (optional, only if strictly useful): {background_phrases}\n"
+        "If you use them, append 1–2 short sentences at the very end labeled 'Background:'. "
+        "Do NOT invent facts beyond these phrases."
     ) if background_phrases else ""
 
-    tone_instruction = (
-        f"Include this concise sentiment summary as one sentence near the start: {tone_line}\n\n"
-        if tone_line
-        else ""
-    )
-
+    # ---- prompt (NO tone/sentiment mention) ----
     prompt = (
-        f"{style}\nQuestion: {question}\nSources (speaker date): {sources_line}\n\n"
-        "Extracted passages (already filtered):\n"
-        f"{('Tone facets: ' + tone_line) if tone_line else ''}\n\n"
-        f"{tone_instruction}"
-        f"{joined_partials}\n\n"
-        f"{bg_instruction}\n"
-        f"Task: Produce ONE coherent factual answer of about {target_words} words. Use ONLY the extracted passages and the provided background phrases (do not invent facts). "
-        "Mention each speaker/date at most once. Merge overlapping points, remove duplication and salutations. If material weakly addresses the question, state the limitation early. Return only the answer paragraph and then, if used, a single short 'Background:' sentence."
+        f"{style}\n"
+        f"Question: {question}\n"
+        f"Sources (speaker date): {sources_line}\n\n"
+        "Extracted passages (already filtered; do not quote bibliographies):\n"
+        f"{joined_partials}\n"
+        f"{bg_instruction}\n\n"
+        f"Task: Produce ONE coherent factual answer of about {target_words} words. "
+        "Use ONLY the extracted passages and the provided background phrases (if any). "
+        "Do NOT invent numbers, quotes, or names not present in the passages. "
+        "Mention each speaker/date at most once. Merge overlapping points, remove duplication and greetings. "
+        "Avoid evaluative language about 'tone' or 'sentiment'; do not write anything like 'balanced', 'hawkish', "
+        "'dovish', 'optimistic', 'cautious', or facet scores. "
+        "If the material only partially answers the question, state that limitation briefly near the start. "
+        "Return only the answer paragraph and, if used, a single short 'Background:' line at the end."
     )
 
-    # larger token budget; lower temperature for factualness
+    # ---- LLM call ----
     max_tok = int(os.getenv("LLM_MAX_TOKENS", "1200"))
     try:
         resp = client.chat.completions.create(
@@ -220,12 +234,13 @@ def _llm_single_merge(question: str, audience_level: str,
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.25")),
             max_tokens=max_tok,
             messages=[
-                {"role": "system", "content": "You are a concise factual summarizer. Do not hallucinate."},
+                {"role": "system", "content": "You are a concise, faithful ECB speech summarizer. Do not hallucinate."},
                 {"role": "user", "content": prompt},
             ],
             timeout=max(LLM_TIMEOUT, 90),
         )
-        out = resp.choices[0].message.content.strip()
+        out = (resp.choices[0].message.content or "").strip()
+        # compact whitespace
         out = re.sub(r"\s+", " ", out)
         if out:
             _FINAL_CACHE[ck] = out
@@ -236,37 +251,10 @@ def _llm_single_merge(question: str, audience_level: str,
                 pass
             return out
     except Exception as e:
-        logger.warning("FINAL LLM merge failed: %s", e)
+        logger.warning("FINAL LLM single-merge failed: %s", e)
 
-    # fallback local merge
+    # ---- fallback local merge ----
     return _merge_partials(question, partials, max_sentences=12)
-
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Load index and metadata
-try:
-    faiss_index = faiss.read_index(FAISS_INDEX_PATH)
-    logger.info("FAISS index loaded.")
-except Exception as e:
-    faiss_index = None
-    logger.error(f"Could not load FAISS index: {e}")
-
-with open(FAISS_META_PATH, "r", encoding="utf-8") as f:
-    FAISS_META = json.load(f)
-
-with open(SPEECH_SIDECAR_PATH, "r", encoding="utf-8") as f:
-    SPEECH_SIDECAR = json.load(f)
-
-try:
-    with open(CHUNKS_PLK, "rb") as f:
-        LEGACY_CHUNKS = pickle.load(f)
-except Exception:
-    LEGACY_CHUNKS = []
-
-# Model loader
-_EMBED_MODEL = None
 
 
 def _strip_bibliography(text: str) -> str:
@@ -618,97 +606,65 @@ def _retrieve_for_speaker(question: str, speaker: str, year_hint: Optional[str])
     )
     return docs[0] if docs else None
 
-
-def _llm_single_merge(
+def _llm_compare_merge(
     question: str,
     audience_level: str,
-    partials: List[str],
-    segments: List[Dict],
-    tone_line: str = ""
+    per_summaries: List[Tuple[str, str, Dict]],
+    tone_line: str = "",
 ) -> str:
     """
-    One LLM call merging all partials into a single coherent paragraph.
-    IMPORTANT: does NOT inject tone/facet text into the prose. The caller is
-    responsible for appending any tone dropdown separately.
+    LLM contrast between multiple speakers.
+    per_summaries: list of (speaker_name, summary_text, meta)
     """
-    if not partials:
-        return ""
+    if not per_summaries or len(per_summaries) < 2:
+        return "Insufficient distinct speaker material to compare."
 
-    # ---- cache key (stable across same speeches) ----
-    speech_ids = [s.get("speech_id", f"{s.get('date','')}_{s.get('title','')}") for s in segments]
-    ck = _final_cache_key(question, audience_level, speech_ids)
-    if ck in _FINAL_CACHE:
-        return _FINAL_CACHE[ck]
-
-    # ---- style / inputs ----
     style = _audience_instructions(audience_level)
-    sources_line = "; ".join(f"{s.get('speaker','')} {s.get('date','')}" for s in segments)
+    blocks = []
+    sources = []
 
-    joined_partials = "\n---\n".join(partials)
-    if len(joined_partials) > 8000:
-        joined_partials = joined_partials[:8000]
+    for spk, summ, meta in per_summaries:
+        title = meta.get("title", "")
+        date = meta.get("date", "")
+        sources.append(f"{spk} {date}")
+        blocks.append(
+            f"Speaker: {spk}\nDate: {date}\nTitle: {title}\nExtractive sentences:\n{summ}"
+        )
 
-    # word target guidance
-    try:
-        target_words = int(FINAL_TARGET_WORDS)
-    except Exception:
-        target_words = 300
+    joined = "\n\n----\n\n".join(blocks)
 
-    # Optional short background blurbs (safe, generic definitions)
-    background_phrases = _educational_blurb(_extract_keywords(question), max_items=2)
-    bg_instruction = (
-        f"\n\nBackground phrases (optional, only if strictly useful): {background_phrases}\n"
-        "If you use them, append 1–2 short sentences at the very end labeled 'Background:'. "
-        "Do NOT invent facts beyond these phrases."
-    ) if background_phrases else ""
-
-    # ---- prompt (NO tone/sentiment mention) ----
     prompt = (
-        f"{style}\n"
-        f"Question: {question}\n"
-        f"Sources (speaker date): {sources_line}\n\n"
-        "Extracted passages (already filtered; do not quote bibliographies):\n"
-        f"{joined_partials}\n"
-        f"{bg_instruction}\n\n"
-        f"Task: Produce ONE coherent factual answer of about {target_words} words. "
-        "Use ONLY the extracted passages and the provided background phrases (if any). "
-        "Do NOT invent numbers, quotes, or names not present in the passages. "
-        "Mention each speaker/date at most once. Merge overlapping points, remove duplication and greetings. "
-        "Avoid evaluative language about 'tone' or 'sentiment'; do not write anything like 'balanced', 'hawkish', "
-        "'dovish', 'optimistic', 'cautious', or facet scores. "
-        "If the material only partially answers the question, state that limitation briefly near the start. "
-        "Return only the answer paragraph and, if used, a single short 'Background:' line at the end."
+        f"{style}\nQuestion: {question}\nSources: {', '.join(sources)}\n"
+        f"{('Tone facets: ' + tone_line) if tone_line else ''}\n\n"
+        f"{joined}\n\n"
+        "Task: Produce ONE paragraph (200-250 words) comparing and contrasting the speakers' positions "
+        "STRICTLY using only the provided sentences. Highlight clear differences and any explicit common ground. "
+        "Do NOT guess intentions or add external context; if a difference is not evidenced, omit it. "
+        "If evidence for one speaker is sparse, acknowledge the limitation. Mention each speaker once. "
+        "Return only the paragraph."
     )
 
-    # ---- LLM call ----
-    max_tok = int(os.getenv("LLM_MAX_TOKENS", "1200"))
     try:
         resp = client.chat.completions.create(
-            model=os.getenv("LLM_MODEL", LLM_MODEL),
-            temperature=float(os.getenv("LLM_TEMPERATURE", "0.25")),
-            max_tokens=max_tok,
+            model=LLM_MODEL,
+            temperature=0.25,
+            max_tokens=480,
             messages=[
-                {"role": "system", "content": "You are a concise, faithful ECB speech summarizer. Do not hallucinate."},
+                {"role": "system", "content": "You compare speakers without hallucinations."},
                 {"role": "user", "content": prompt},
             ],
-            timeout=max(LLM_TIMEOUT, 90),
+            timeout=50,
         )
-        out = (resp.choices[0].message.content or "").strip()
-        # compact whitespace
+        out = resp.choices[0].message.content.strip()
         out = re.sub(r"\s+", " ", out)
-        if out:
-            _FINAL_CACHE[ck] = out
-            _save_final_cache()
-            try:
-                _inc_llm_used()
-            except Exception:
-                pass
-            return out
-    except Exception as e:
-        logger.warning("FINAL LLM single-merge failed: %s", e)
+        return out
 
-    # ---- fallback local merge ----
-    return _merge_partials(question, partials, max_sentences=12)
+    except Exception as e:
+        logger.warning("compare merge failed: %s", e)
+        # Fallback: stitch summaries with simple labels
+        stitched = " ".join(f"{spk}: {summ}" for spk, summ, _ in per_summaries)
+        return stitched[:1500]
+    
 
 
 # FAISS search + hybrid re-ranking
